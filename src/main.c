@@ -9,6 +9,8 @@
 #include <openssl/err.h>
 #include <zlib.h>
 #include <pthread.h>
+#include <string.h>
+#include <signal.h>
 
 #define MAX_EVENTS 10000
 #define MAX_CONNECTIONS 100000
@@ -218,7 +220,138 @@ typedef struct {
   pthread_mutex_t stats_mutex;
 } http_server_t;
 
-int main() {
-  printf("Hello World\n!");
+// Function prototypes
+int http_server_init(http_server_t *server, int port, const char *document_root);
+int http_server_start(http_server_t *server);
+int http_server_stop(http_server_t *server);
+int http_server_cleanup(http_server_t *server);
+
+// GLobal server instance
+static http_server_t g_server;
+static volatile bool g_running = true;
+
+void signal_handler(int signum) {
+  g_running = false;
+  g_server.running = false;
+}
+
+int main(int argc, char *argv[]) {
+  int port = 8080;
+  char *document_root = "/var/www/html";
+
+  // Parse command line arguments
+  if (argc > 1) {
+    port = atoi(argv[1]);
+  }
+  if (argc > 2) {
+    document_root = argv[2];
+  }
+
+  // Setup signal handlers
+  signal(SIGINT, signal_handler);
+  signal(SIGTERM, signal_handler);
+  signal(SIGPIPE, SIG_IGN);
+
+  // Initialize HTTP server
+  if (http_server_init(&g_server, port, document_root) != 0) {
+    fprintf(stderr, "Failed to initialize HTTP server\n");
+    return 1;
+  }
+
+  // TODO: Start the server
+
+  printf("HTTP server started on port %d\n", port);
+  printf("Document root: %s\n", document_root);
+
+  // Main loop
+  while (g_running) {
+    sleep(10);
+  }
+
+  // Stop and cleanup
+  http_server_cleanup(&g_server);
+
+  printf("HTTP server stopped\n");
+
+  return 0;
+}
+
+int http_server_init(http_server_t *server, int port, const char *document_root) {
+  if (!server) {
+    return -1;
+  }
+
+  memset(server, 0, sizeof(http_server_t));
+
+  server->listen_port = port;
+  server->document_root = strdup(document_root);
+  server->server_name = strdup("OTA-HTTP-Server/1.0");
+  server->max_connections = MAX_CONNECTIONS;
+  server->enable_keepalive = true;
+  server->keepalive_timeout = KEEPALIVE_TIMEOUT;
+  server->enable_compression = true;
+  server->max_request_size = MAX_REQUEST_SIZE;
+  server->worker_count = WORKER_THREADS;
+  // server->default_handler = default_file_handler;
+  server->running = true;
+
+  // TODO: Initialize statistics mutex
+
+  // Create listening socket
+  server->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (server->listen_fd < 0) {
+    perror("socket");
+    return -1;
+  }
+
+  // TODO: set socket options
+
+  // Bind to port
+  struct sockaddr_in server_addr;
+  memset(&server_addr, 0, sizeof(server_addr));
+  server_addr.sin_family = AF_INET;
+  server_addr.sin_addr.s_addr = INADDR_ANY;
+  server_addr.sin_port = htons(port);
+
+  if (bind(server->listen_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+    perror("bind");
+    close(server->listen_fd);
+    return -1;
+  }
+
+  // Listen for connections
+  if (listen(server->listen_fd, BACKLOG) < 0) {
+    perror("listen");
+    close(server->listen_fd);
+    return -1;
+  }
+
+  return 0;
+}
+
+int http_server_cleanup(http_server_t *server) {
+  if (!server) {
+    return -1;
+  }
+
+  // TODO: Stop worker threads
+  // for (int i = 0; i < server->worker_count; i++) {
+
+  // }
+
+  // Close listening port
+  if (server->listen_fd > 0) {
+    close(server->listen_fd);
+  }
+
+  // TODO: Cleanup SSL
+
+  // Free resources
+  free(server->document_root);
+  free(server->server_name);
+
+  // TODO: Cleanup routes
+
+  printf("HTTP server cleanup completed\n");
   return 0;
 }
