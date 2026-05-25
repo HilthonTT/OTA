@@ -13,6 +13,7 @@
 #include <string.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <strings.h>
 
 #define MAX_EVENTS 10000
 #define MAX_CONNECTIONS 100000
@@ -36,7 +37,7 @@ typedef enum {
   HTTP_PATCH,
   HTTP_CONNECT,
   HTTP_TRACE,
-  HTTP_UNTRACE,
+  HTTP_UNKNOWN,
 } http_method_t;
 
 // HTTP status codes
@@ -452,8 +453,103 @@ int send_error_response(connection_t *conn, http_status_t status, const char *me
 }
 
 bool is_valid_uri(const char *uri) {
-  // TODO: Implement this laters
-  return false;
+  if (!uri) {
+    return false;
+  }
+
+  // Check for directory traversal
+  if (strstr(uri, "../") != NULL || strstr(uri, "..\\") != NULL) {
+    return false;
+  }
+
+  // Check for null bytes
+  for (const char *p = uri; *p; p++) {
+    if (*p == '\0') {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+int send_http_response(connection_t *conn, http_response_t *response) {
+  if (!conn || !response) {
+    return -1;
+  }
+
+  // Generate response headers
+  char header_buffer[MAX_HEADERS_SIZE];
+  int header_len = snprintf(header_buffer, sizeof(header_buffer),
+                            "%s %d %s\r\n",
+                            "Server: %s\r\n",
+                            "Date: %s\r\n",
+                            "Content-Length: %zu\r\n",
+                            "Connection: %s\r\n",
+                            response->version,
+                            response->status,
+                            http_status_to_string(response->status),
+                            g_server.server_name,
+                            "Thu, 01 Jan 1970 00:00:00 GMT", // TODO: Format current time
+                            response->body_length,
+                            response->keep_alive ? "keep-alive" : "close");
+
+  // Add custom headers
+  for (int i = 0; i < response->header_count; i++) {
+    header_len += snprintf(header_buffer + header_len, sizeof(header_buffer) - header_len,
+                          "%s: %s\r\n",
+                          response->headers[i].name,
+                          response->headers[i].value);
+  }
+
+  // End headers
+  header_len += snprintf(header_buffer + header_len, sizeof(header_buffer) - header_len, "\r\n");
+
+  // Copy headers and body to write buffer
+  conn->write_buffer_size = header_len + response->body_length;
+  if (conn->write_buffer_size > MAX_RESPONSE_SIZE) {
+    return -1; // Response too large
+  }
+
+  memcpy(conn->write_buffer, header_buffer, header_len);
+  if (response->body && response->body_length > 0) {
+    memcpy(conn->write_buffer + header_len, response->body, response->body_length);
+  }
+
+  conn->write_buffer_pos = 0;
+  return 0;
+}
+
+const char *http_status_to_string(http_status_t status) {
+  switch (status)
+  {
+    case HTTP_OK: return "OK";
+    case HTTP_CREATED: return "Created";
+    case HTTP_ACCEPTED: return "Accepted";
+    case HTTP_NO_CONTENT: return "No Content";
+    case HTTP_BAD_REQUEST: return "Bad Request";
+    case HTTP_UNAUTHORIZED: return "Unauthorized";
+    case HTTP_FORBIDDEN: return "Forbidden";
+    case HTTP_NOT_FOUND: return "Not Found";
+    case HTTP_METHOD_NOT_ALLOWED: return "Method Not Allowed";
+    case HTTP_INTERNAL_SERVER_ERROR: return "Internal Server Error";
+    case HTTP_NOT_IMPLEMENTED: return "Not Implemented";
+    case HTTP_BAD_GATEWAY: return "Bad Gateway";
+    case HTTP_SERVICE_UNAVAILABLE: return "Service Unavailable";
+    default: return "Unknown";
+  }
+}
+
+http_method_t string_to_http_method(const char *method) {
+  if (strcasecmp(method, "GET") == 0) return HTTP_GET;
+  if (strcasecmp(method, "POST") == 0) return HTTP_POST;
+  if (strcasecmp(method, "PUT") == 0) return HTTP_PUT;
+  if (strcasecmp(method, "DELETE") == 0) return HTTP_DELETE;
+  if (strcasecmp(method, "HEAD") == 0) return HTTP_HEAD;
+  if (strcasecmp(method, "OPTIONS") == 0) return HTTP_OPTIONS;
+  if (strcasecmp(method, "PATCH") == 0) return HTTP_PATCH;
+  if (strcasecmp(method, "CONNECT") == 0) return HTTP_CONNECT;
+  if (strcasecmp(method, "TRACE") == 0) return HTTP_TRACE;
+  return HTTP_UNKNOWN;
 }
 
 int http_server_cleanup(http_server_t *server) {
