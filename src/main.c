@@ -14,6 +14,8 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <strings.h>
+#include <sys/epoll.h>
+#include <unistd.h>
 
 #define MAX_EVENTS 10000
 #define MAX_CONNECTIONS 100000
@@ -315,7 +317,19 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  // Enable SSL if certificates are available
+  if (access("server.crt", F_OK) == 0 && access("server.key", F_OK) == 0) {
+    if (init_ssl(&g_server, "server.crt", "server.key") == 0) {
+      printf("SSL enabled\n");
+    }
+  }
+
   // TODO: Start the server
+  if (http_server_start(&g_server) != 0) {
+    fprintf(stderr, "Failed to start HTTP server\n");
+    http_server_cleanup(&g_server);
+    return 1;
+  }
 
   printf("HTTP server started on port %d\n", port);
   printf("Document root: %s\n", document_root);
@@ -389,6 +403,107 @@ int http_server_init(http_server_t *server, int port, const char *document_root)
   return 0;
 }
 
+int http_server_start(http_server_t *server) {
+  if (!server) {
+    return -1;
+  }
+
+  for (int i = 0; i < server->worker_count; i++) {
+    worker_thread_t *worker = &server->workers[i];
+    worker->thread_id = i;
+    worker->running = true;
+
+    // Create epoll instance for this worker
+    worker->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (worker->epoll_fd < 0) {
+      perror("epoll_create1");
+      return -1;
+    }
+
+    // Create worker thread
+    if (pthread_create(&worker->thread, NULL, worker_thread_function, worker) != 0) {
+      perror("pthread_create");
+      return -1;
+    }
+  }
+  
+  // Accept connections and distribute to workers
+  int worker_index = 0;
+  while (server->running) {
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+
+    int client_fd = accept(server->listen_fd, (struct sockaddr *)&client_addr, &client_len);
+    if (client_fd < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        usleep(1000); // 1ms
+        continue;
+      }
+      perror("accept");
+      continue;
+    }
+
+    // Set client socket options
+    set_socket_nonblocking(client_fd);
+    set_socket_options(client_fd);
+
+    // Distribute connection to worker
+    worker_thread_t *worker = &server->workers[worker_index];
+    if (handle_new_connection(worker, client_fd) != 0) {
+      close(client_fd);
+    }
+
+    worker_index = (worker_index + 1) % server->worker_count;
+
+    // Update statistics
+    pthread_mutex_lock(&server->stats_mutex);
+    server->total_connections++;
+    server->active_connections_count++;
+    pthread_mutex_unlock(&server->stats_mutex);
+  }
+
+  return 0;
+}
+
+int handle_new_connection(worker_thread_t *worker, int client_fd) {
+  // Allocate connection structure
+  connection_t *conn = allocate_connection(&g_server);
+  if (!conn) {
+    return -1;
+  }
+
+  conn->socket_fd = client_fd;
+  conn->state = CONN_STATE_READING_REQUEST;
+  conn->last_activity = time(NULL);
+  conn->connection_time = conn->last_activity;
+
+  // Add to worker's connection list
+  conn->next = worker->connections;
+  if (worker->connections) {
+    worker->connections->prev = conn;
+  }
+
+  worker->connections = conn;
+  worker->connection_count++;
+
+  // Add to epoll
+  struct epoll_event event;
+  event.events = EPOLLIN | EPOLLET;
+  event.data.ptr = conn;
+
+  if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_ADD, client_fd, &event) < 0) {
+    perror("epoll_ctl");
+    return -1;
+  }
+
+  return 0;
+}
+
+connection_t *allocate_connection(http_server_t *server) {
+  connection_t* conn = memset(server, 0, sizeof(connection_t));
+  return conn;
+}
+
 int set_socket_nonblocking(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
   if (flags < 0) {
@@ -410,6 +525,11 @@ int set_socket_options(int fd) {
     return -1;
   }
 
+  return 0;
+}
+
+int init_ssl(http_server_t *server, const char *cert_file, const char *key_file) {
+  // TODO: Implement this
   return 0;
 }
 
@@ -448,8 +568,26 @@ int send_file_response(connection_t *conn, const char *file_path) {
 }
 
 int send_error_response(connection_t *conn, http_status_t status, const char *message) {
-  // TODO: Implement this later
-  return 0;
+  char error_body[1024];
+  snprintf(error_body, sizeof(error_body),
+          "<html><head><title>%s %d</title></head>",
+          "<body><h1>%d %s</h1><p>%s</p></body></html>",
+          status, http_status_to_string(status),
+          status, http_status_to_string(status),
+          message);
+    
+  conn->response.status = status;
+  strcpy(conn->response.version, "HTTP/1.1");
+  conn->response.body = strdup(error_body);
+  conn->response.body_length = strlen(error_body);
+  conn->response.keep_alive = false;
+
+  // Add HTML content type header
+  strcpy(conn->response.headers[0].name, "Content-Type");
+  strcpy(conn->response.headers[0].value, "text/html");
+  conn->response.header_count = 1;
+
+  return send_http_response(conn, &conn->response);
 }
 
 bool is_valid_uri(const char *uri) {
@@ -480,7 +618,7 @@ int send_http_response(connection_t *conn, http_response_t *response) {
   // Generate response headers
   char header_buffer[MAX_HEADERS_SIZE];
   int header_len = snprintf(header_buffer, sizeof(header_buffer),
-                            "%s %d %s\r\n",
+                            "%s %s %s\r\n",
                             "Server: %s\r\n",
                             "Date: %s\r\n",
                             "Content-Length: %zu\r\n",
@@ -550,6 +688,18 @@ http_method_t string_to_http_method(const char *method) {
   if (strcasecmp(method, "CONNECT") == 0) return HTTP_CONNECT;
   if (strcasecmp(method, "TRACE") == 0) return HTTP_TRACE;
   return HTTP_UNKNOWN;
+}
+
+void *worker_thread_function(void *arg) {
+  worker_thread_t *worker = (worker_thread_t *)arg;
+  struct epoll_event events[MAX_EVENTS];
+
+  // Set thread name
+  char thread_name[16];
+  snprintf(thread_name, sizeof(thread_name), "http_worker_%d", worker->thread_id);
+  pthread_setname_np(pthread_self(), thread_name);
+
+  return NULL;
 }
 
 int http_server_cleanup(http_server_t *server) {
